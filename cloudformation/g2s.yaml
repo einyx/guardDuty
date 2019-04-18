@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Demonstrates how to connect GuardDuty to your Slack channel. The template Installs
+  a Lambda function that writes CW Events to a Slack incoming web hook. This relies
+  on you creating an *incoming web hook* in your slack account and simply passing
+  the URL as a parameter to this template
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Slack Configuration
+        Parameters:
+          - IncomingWebHookURL
+          - SlackChannel
+          - MinSeverityLevel
+    ParameterLabels:
+      IncomingWebHookURL:
+        default: Slack Incoming Web Hook URL
+      SlackChannel:
+        default: Slack channel to send findings to
+      MinSeverityLevel:
+        default: Minimum severity level (LOW, MED, HIGH)
+Parameters:
+  IncomingWebHookURL:
+    Default: https://hooks.slack.com/services/XXXXXX/YYYYY/REPLACE_WITH_YOURS
+    Description: Your unique Incoming Web Hook URL from slack service
+    Type: String
+  SlackChannel:
+    Default: '#general'
+    Description: The slack channel to send findings to
+    Type: String
+  MinSeverityLevel:
+    Default: LOW
+    Description: The minimum findings severity to send to your slack channel (LOW,
+      MEDIUM or HIGH)
+    Type: String
+    AllowedValues:
+      - LOW
+      - MEDIUM
+      - HIGH
+Resources:
+  GuardDutyToSlackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies: []
+  ScheduledRule:
+    DependsOn: findingsToSlack
+    Type: AWS::Events::Rule
+    Properties:
+      Description: GuardDutyRule
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+      Targets:
+        - Arn: !GetAtt 'findingsToSlack.Arn'
+          Id: GuardDutyFunction
+  LambdaInvokePermission:
+    DependsOn:
+      - findingsToSlack
+      - ScheduledRule
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      FunctionName: !GetAtt 'findingsToSlack.Arn'
+      SourceArn: !GetAtt 'ScheduledRule.Arn'
+  findingsToSlack:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt 'GuardDutyToSlackRole.Arn'
+      Code:
+        ZipFile: >
+          'use strict';
+          const AWS = require('aws-sdk');
+          const url = require('url');
+          const https = require('https');
+
+          const webHookUrl = process.env['webHookUrl'];
+          const slackChannel = process.env.slackChannel;
+          const minSeverityLevel = process.env['minSeverityLevel'];
+
+          function postMessage(message, callback) {
+              const body = JSON.stringify(message);
+              const options = url.parse(webHookUrl);
+              options.method = 'POST';
+              options.headers = {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(body),
+              };
+              const postReq = https.request(options, (res) => {
+                  const chunks = [];
+                  res.setEncoding('utf8');
+                  res.on('data', (chunk) => chunks.push(chunk));
+                  res.on('end', () => {
+                      if (callback) {
+                          callback({
+                              body: chunks.join(''),
+                              statusCode: res.statusCode,
+                              statusMessage: res.statusMessage,
+                          });
+                      }
+                  });
+                  return res;
+              });
+
+              postReq.write(body);
+              postReq.end();
+          }
+
+          function processEvent(event, callback) {
+              const message = event;
+              const consoleUrl = `https://console.aws.amazon.com/guardduty`;
+              const finding = message.detail.type;
+              const findingDescription = message.detail.description;
+              const findingTime = message.detail.updatedAt;
+              const findingTimeEpoch = Math.floor(new Date(findingTime) / 1000);
+              const account = message.detail.accountId;
+              const region = message.region;
+              const messageId = message.detail.id;
+              const lastSeen = `<!date^${findingTimeEpoch}^{date} at {time} | ${findingTime}>`;
+              var color = '#7CD197';
+              var severity = '';
+
+              if (message.detail.severity < 4.0) {
+                  if (minSeverityLevel !== 'LOW') {
+                      callback(null);
+                      return;
+                  }
+                  severity = 'Low';
+              } else if (message.detail.severity < 7.0) {
+                  if (minSeverityLevel === 'HIGH') {
+                      callback(null);
+                      return;
+                  }
+                  severity = 'Medium';
+                  color = '#e2d43b';
+              } else {
+                  severity = 'High';
+                  color = '#ad0614';
+              }
+
+              const attachment = [{
+                  "fallback": finding + ` - ${consoleUrl}/home?region=` +
+                      `${region}#/findings?search=id%3D${messageId}`,
+                  "pretext": `*Finding in ${region} for Acct: ${account}*`,
+                  "title": `${finding}`,
+                  "title_link": `${consoleUrl}/home?region=${region}#/findings?search=id%3D${messageId}`,
+                  "text": `${findingDescription}`,
+                  "fields": [
+                      { "title": "Severity", "value": `${severity}`, "short": true },
+                      { "title": "Region", "value": `${region}`, "short": true },
+                      { "title": "Last Seen", "value": `${lastSeen}`, "short": true }
+                  ],
+                  "mrkdwn_in": ["pretext"],
+                  "color": color
+              }];
+
+              const slackMessage = {
+                  channel: slackChannel,
+                  text: '',
+                  attachments: attachment,
+                  username: 'GuardDuty',
+                  'mrkdwn': true,
+                  icon_url: 'https://raw.githubusercontent.com/aws-samples/amazon-guardduty-to-slack/master/images/gd_logo.png'
+              };
+
+              postMessage(slackMessage, (response) => {
+                  if (response.statusCode < 400) {
+                      console.info('Message posted successfully');
+                      callback(null);
+                  } else if (response.statusCode < 500) {
+                      console.error(`Error posting message to Slack API: ${response.statusCode} - ${response.statusMessage}`);
+                      callback(null);
+                  } else {
+                      callback(`Server error when processing message: ${response.statusCode} - ${response.statusMessage}`);
+                  }
+              });
+          }
+
+          exports.handler = (event, context, callback) => {
+              processEvent(event, callback);
+          };
+
+      Environment:
+        Variables:
+          slackChannel: !Ref 'SlackChannel'
+          webHookUrl: !Ref 'IncomingWebHookURL'
+          minSeverityLevel: !Ref 'MinSeverityLevel'
+      Runtime: nodejs8.10
+      MemorySize: '128'
+      Timeout: '10'
+      Description: Lambda to push GuardDuty findings to slack
+      TracingConfig:
+        Mode: Active

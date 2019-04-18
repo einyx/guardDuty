@@ -1,0 +1,19 @@
+version: 0.1
+stack:
+  name: guardDutyToSlackNotifier
+
+  template:
+    file: g2s.yaml
+    bucket: cim-stacks-upload
+
+  parameters:
+    IncomingWebHookURL: 'https://hooks.slack.com/services/XXXXXX/YYYYY/REPLACE_WITH_YOURS'
+    SlackChannel: '#general'
+    MinSeverityLevel: 'LOW'
+
+  capabilities:
+    - 'CAPABILITY_IAM'
+  tags:
+    app: guardDutyToSlackNotifier
+    owner: DevSecOps
+env: prod
